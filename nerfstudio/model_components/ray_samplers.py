@@ -1,6 +1,6 @@
 # Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "License")
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -23,9 +23,11 @@ import torch
 from jaxtyping import Float
 from nerfacc import OccGridEstimator
 from torch import Tensor, nn
+import nerfacc
+import py_f2nerf
 
 from nerfstudio.cameras.rays import Frustums, RayBundle, RaySamples
-
+from nerfstudio.field_components.field_heads import FieldHeadNames
 
 class Sampler(nn.Module):
     """Generate Samples
@@ -685,7 +687,7 @@ class NeuSSampler(Sampler):
                 ray_samples, sdf.reshape(ray_samples.shape), inv_s=base_variance * 2**total_iters
             )
 
-            weights = ray_samples.get_weights_and_transmittance_from_alphas(alphas[..., None], weights_only=True)
+            weights = ray_samples.get_weights_and_trans_from_alphas(alphas[..., None], weights_only=True)
             weights = torch.cat((weights, torch.zeros_like(weights[:, :1])), dim=1)
 
             new_samples = self.pdf_sampler(
@@ -785,3 +787,138 @@ class NeuSSampler(Sampler):
         )
 
         return ray_samples, sorted_index
+
+
+class F2NeRFSampler(Sampler):
+    """Sampler of F2NeRF
+
+    Args:
+        num_samples: Number of samples per ray
+    """
+
+    def __init__(
+        self,
+        global_data_pool,
+        density_fn
+    ) -> None:
+        super().__init__()
+        self.global_data_pool = global_data_pool
+        self.sampler_ = py_f2nerf.PersSampler(global_data_pool)
+        # self.field = field
+        self.density_fn = density_fn
+        # buffers 
+        tree_nodes, pers_trans, tree_visit_cnt, milestones_ts = self.sampler_.States()
+        self.register_buffer("tree_nodes", tree_nodes.clone())
+        self.register_buffer("pers_trans", pers_trans.clone())
+        self.register_buffer("tree_visit_cnt", tree_visit_cnt.clone())
+        self.register_buffer("milestones_ts", milestones_ts.clone())
+        self.register_buffer("ray_march_fineness", torch.tensor(self.global_data_pool.ray_march_fineness))
+        # cache
+        self.sample_result_ = None
+        self.weights_ = None
+        self.alphas_ = None
+
+    def update_octree(self):
+        self.sampler_.UpdateOctNodes(self.sample_result_,
+                            self.weights_.detach(),
+                            self.alphas_.detach()
+                            )
+        self.tree_nodes, self.pers_trans, self.tree_visit_cnt, self.milestones_ts = \
+            self.sampler_.States()
+
+    def update_f2nerf_states(self):
+        self.sampler_.LoadStates([
+            self.tree_nodes, self.pers_trans, 
+            self.tree_visit_cnt, self.milestones_ts
+        ], 0)
+        self.global_data_pool.ray_march_fineness = self.ray_march_fineness.item()
+
+    def forward(
+        self,
+        ray_bundle: Optional[RayBundle] = None,
+    ) -> Tuple[RaySamples, Float[Tensor, "total_samples "]]:
+        """
+
+        Args:
+            ray_bundle: Rays to generate samples for
+            num_samples: Number of samples per ray
+
+        Returns:
+            Positions and deltas for samples along a ray
+        """
+        assert ray_bundle is not None
+        # assert ray_bundle.nears is not None
+        # assert ray_bundle.fars is not None
+
+        num_rays = ray_bundle.origins.shape[0]
+
+        rays_o = ray_bundle.origins.contiguous()
+        rays_d = ray_bundle.directions.contiguous()
+        if ray_bundle.camera_indices is not None:
+            camera_indices = ray_bundle.camera_indices.contiguous()
+        else:
+            camera_indices = None
+
+        # rays_bound = torch.cat([ray_bundle.nears, ray_bundle.fars], -1)
+        rays_bound = torch.zeros(1) # not used
+        samples = self.sampler_.GetSamples(rays_o, rays_d, rays_bound)
+        self.sample_result_ = samples
+        # from IPython import embedembed()
+        # slice valid ray samples
+        idx_bounds = samples.pts_idx_bounds # (N, 2) start end
+        pts_warp = samples.pts_warp
+        anchors = samples.anchors
+        starts = samples.t
+        ends = starts + samples.dt
+
+        with torch.no_grad():
+            sampled_density = self.density_fn(pts_warp, anchors)
+            # sampled_density = self.density_fn(samples.pts)
+            sec_density = sampled_density[:,0] * samples.dt_warp # original impl
+            # sec_density = sampled_density[:,0] * samples.dt
+            alphas = 1. - torch.exp(-sec_density)
+            acc_density = py_f2nerf.AccumulateSum(sec_density, idx_bounds, False)
+            trans = torch.exp(-acc_density)
+            weights = trans * alphas
+            self.weights_ = weights.detach()
+            self.alphas_ = alphas.detach() # for update_octree
+
+            # early stop
+            mask = trans > 1e-4 # original impl
+            starts = starts[mask].contiguous()
+            ends = ends[mask].contiguous()
+            anchors = anchors[mask].contiguous()
+            pts_warp = pts_warp[mask].contiguous()
+            idx_bounds = py_f2nerf.FilterIdxBounds(idx_bounds, mask)
+            assert idx_bounds.max() == anchors.shape[0]
+        
+            ray_indices = py_f2nerf.ScatterIdx(len(starts), idx_bounds, torch.arange(0, num_rays).to(rays_o.device).int()).long()
+
+            origins = rays_o[ray_indices]
+            dirs = rays_d[ray_indices]
+            if camera_indices is not None:
+                camera_indices = camera_indices[ray_indices]
+
+        
+            # weights, trans, alphas = self.field_fn(ray_samples, ray_indices, num_rays)
+            # self.weights_ = weights
+            # self.alphas_ = alphas # for update_octree
+            # mask = trans > 1e-4
+            ray_samples = RaySamples(
+                frustums=Frustums(
+                    origins=origins,
+                    directions=dirs,
+                    starts=starts[:, None],
+                    ends=ends[:, None],
+                    pixel_area=ray_bundle[ray_indices].pixel_area,
+                ),
+                camera_indices=camera_indices,
+                metadata={"anchors": anchors.contiguous(), 
+                          "pts_warp": pts_warp, 
+                          "dt_warp": samples.dt_warp[mask].contiguous().unsqueeze(-1)}
+            )
+            
+            if ray_bundle.times is not None:
+                ray_samples.times = ray_bundle.times[ray_indices]   
+
+        return ray_samples, ray_indices

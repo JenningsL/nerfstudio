@@ -68,6 +68,7 @@ from nerfstudio.models.neus_facto import NeuSFactoModelConfig
 from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
+from nerfstudio.models.f2nerf import F2NeRFModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.pipelines.dynamic_batch import DynamicBatchPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
@@ -87,6 +88,7 @@ descriptions = {
     "generfacto": "Generative Text to NeRF model",
     "neus": "Implementation of NeuS. (slow)",
     "neus-facto": "Implementation of NeuS-Facto. (slow)",
+    "f2-nerf": "F2-NeRF"
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -588,6 +590,38 @@ method_configs["neus-facto"] = TrainerConfig(
         "field_background": {
             "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
             "scheduler": CosineDecaySchedulerConfig(warm_up_end=500, learning_rate_alpha=0.05, max_steps=20001),
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
+method_configs["f2-nerf"] = TrainerConfig(
+    method_name="f2-nerf",
+    steps_per_eval_batch=500,
+    steps_per_save=2000,
+    max_num_iterations=20000,
+    mixed_precision=False,
+    # pipeline=VanillaPipelineConfig(
+    pipeline=DynamicBatchPipelineConfig(
+        datamanager=VanillaDataManagerConfig(
+            dataparser=NerfstudioDataParserConfig(),
+            train_num_rays_per_batch=2048,
+            eval_num_rays_per_batch=512,
+        ),
+        model=F2NeRFModelConfig(
+            eval_num_rays_per_chunk=1024,
+            camera_optimizer=CameraOptimizerConfig(mode="off"),
+        ),
+    ),
+    optimizers={
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
+            "scheduler": CosineDecaySchedulerConfig(warm_up_end=1000, learning_rate_alpha=0.1, max_steps=20000),
+        },
+        "camera_opt": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=5000),
         },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),

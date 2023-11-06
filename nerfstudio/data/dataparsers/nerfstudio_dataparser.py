@@ -33,6 +33,7 @@ from nerfstudio.data.utils.dataparsers_utils import (
     get_train_eval_split_interval,
     get_train_eval_split_all,
 )
+from nerfstudio.data.utils.colmap_parsing_utils import read_model, qvec2rotmat
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -92,10 +93,16 @@ class Nerfstudio(DataParser):
             meta = load_from_json(self.config.data / "transforms.json")
             data_dir = self.config.data
 
+        if (self.config.data / "colmap" / "sparse" / "0").exists():
+            sparse_bounds = self.get_bounds_from_colmap_sparse(self.config.data / "colmap" / "sparse" / "0")
+        else:
+            sparse_bounds = None
+
         image_filenames = []
         mask_filenames = []
         depth_filenames = []
         poses = []
+        ray_bounds = []
 
         fx_fixed = "fl_x" in meta
         fy_fixed = "fl_y" in meta
@@ -128,6 +135,9 @@ class Nerfstudio(DataParser):
         for frame in frames:
             filepath = Path(frame["file_path"])
             fname = self._get_fname(filepath, data_dir)
+
+            if sparse_bounds is not None:
+                ray_bounds.append(sparse_bounds[str(fname.name)])
 
             if not fx_fixed:
                 assert "fl_x" in frame, "fx not specified in frame"
@@ -262,6 +272,10 @@ class Nerfstudio(DataParser):
             )
         )
 
+        if sparse_bounds is not None:
+            ray_bounds = torch.from_numpy(np.array(ray_bounds).astype(np.float32))[idx_tensor]
+            ray_bounds *= scale_factor
+
         if "camera_model" in meta:
             camera_type = CAMERA_MODEL_TO_TYPE[meta["camera_model"]]
         else:
@@ -317,6 +331,8 @@ class Nerfstudio(DataParser):
             dataparser_scale=scale_factor,
             dataparser_transform=transform_matrix,
             metadata={
+                "cameras": cameras,
+                "ray_bounds": ray_bounds,
                 "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
                 "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
             },
@@ -353,3 +369,31 @@ class Nerfstudio(DataParser):
         if self.downscale_factor > 1:
             return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
         return data_dir / filepath
+
+    def get_bounds_from_colmap_sparse(self, sparse_path: Path):
+        cameras, images, points3D = read_model(sparse_path)
+
+        n_images = len(images)
+        n_pts = len(points3D)
+
+        point3d_id_to_idx = {}
+        pts3d = []
+        for pid, p in points3D.items():
+            point3d_id_to_idx[pid] = len(pts3d)
+            pts3d.append(p.xyz)
+        pts3d = np.array(pts3d)
+
+        bounds = {}
+        for image in images.values():
+            R = qvec2rotmat(image.qvec)
+            t = image.tvec.reshape(3,1)
+            pts3d_cam = R @ pts3d.T + t
+            vis_mask = np.zeros(n_pts, dtype=bool)
+            for pid in image.point3D_ids[image.point3D_ids!=-1]:
+                vis_mask[point3d_id_to_idx[pid]] = True
+            depth = pts3d_cam[2, vis_mask]
+            near_depth, far_depth = np.percentile(depth, 1.), np.percentile(depth, 99.)
+            near_depth = near_depth * .5
+            far_depth = far_depth * 5.
+            bounds[image.name] = [near_depth, far_depth]
+        return bounds
