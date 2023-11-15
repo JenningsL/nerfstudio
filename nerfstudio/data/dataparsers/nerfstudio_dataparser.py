@@ -137,7 +137,7 @@ class Nerfstudio(DataParser):
             fname = self._get_fname(filepath, data_dir)
 
             if sparse_bounds is not None:
-                ray_bounds.append(sparse_bounds[str(fname.name)])
+                ray_bounds.append(sparse_bounds[frame["colmap_im_id"]])
 
             if not fx_fixed:
                 assert "fl_x" in frame, "fx not specified in frame"
@@ -395,5 +395,5 @@ class Nerfstudio(DataParser):
             near_depth, far_depth = np.percentile(depth, 1.), np.percentile(depth, 99.)
             near_depth = near_depth * .5
             far_depth = far_depth * 5.
-            bounds[image.name] = [near_depth, far_depth]
+            bounds[image.id] = [near_depth, far_depth]
         return bounds

@@ -265,7 +265,7 @@ method_configs["instant-ngp"] = TrainerConfig(
             train_num_rays_per_batch=4096,
             eval_num_rays_per_batch=4096,
         ),
-        model=InstantNGPModelConfig(eval_num_rays_per_chunk=8192),
+        model=InstantNGPModelConfig(eval_num_rays_per_chunk=2048),
     ),
     optimizers={
         "fields": {
@@ -610,7 +610,7 @@ method_configs["f2-nerf"] = TrainerConfig(
             eval_num_rays_per_batch=512,
         ),
         model=F2NeRFModelConfig(
-            eval_num_rays_per_chunk=1024,
+            eval_num_rays_per_chunk=2048,
             camera_optimizer=CameraOptimizerConfig(mode="off"),
         ),
     ),
